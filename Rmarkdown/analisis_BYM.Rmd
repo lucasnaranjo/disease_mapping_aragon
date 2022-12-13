@@ -1,0 +1,171 @@
+---
+title: "Mortalidad por enfermedad isquemica en hombres en Aragon"
+author: Lucas Naranjo
+output:
+  pdf_document: default
+  html_document: default
+date: "2022-12-13"
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+En esta practica nos disponemos a estudiar la mortalidad por enfermedad
+isquemica en hombres en Aragon durante el periodo 1991-2000.  
+Usaremos el modelo de Besag, York y Molie.
+
+Cargamos librerias:
+
+```{r}
+library(tidyverse);
+library(rgdal);
+library(spdep);
+library(viridis);
+library(gridExtra);
+library(maptools);
+library(spdep);
+library(rgdal)
+library(rstan);
+options(mc.cores = 3);
+```
+
+Cargamos datos y reordenamos los datos del mapa para que coincidan con los datos
+de mortalidad.
+
+```{r}
+load("../datos/Aragon.Rdata");
+aragon_shp <- readOGR("../mapas");
+aragon_shp <- aragon_shp[order(aragon_shp$CODMUNI),];
+```
+
+
+La variable de interés es el número de muertes observadas.
+Usaremos el valor esperado de cada municipio como offset.
+
+```{r}
+y = Aragon.df$O;
+E = Aragon.df$E;
+```
+
+
+# BYM con STAN
+
+Creamos todos los objetos que necesitará el modelo.
+
+```{r}
+nb_aragon <- poly2nb(aragon_shp);
+coords <- coordinates(aragon_shp);
+source("../funciones/nb_data_funs.R");
+nbs=nb2graph(nb_aragon);
+N = nbs$N;
+node1 = nbs$node1;
+node2 = nbs$node2;
+N_edges = nbs$N_edges;
+scaling_factor = scale_nb_components(nb_aragon)[1];
+```
+
+El modelo BYM con offset está ubicado en la carpeta `/modelos`.
+Iniciamos el sampleo.
+
+```{r}
+set.seed(123);
+bym2_stan <- stan_model("../modelos/bym2_offset_only.stan");
+bym2_fit <- sampling(bym2_stan,
+                    data=list(N=N,N_edges=N_edges,node1=node1,node2=node2,y=y,E=E,scaling_factor=scaling_factor), 
+                    control = list(adapt_delta = 0.97), chains=3, warmup=7000, iter=8000, save_warmup=FALSE)
+```
+
+Guardamos la totalidad de los valores obtenidos en `parameter_samples` y la
+media en`parameter_mean`.
+El objeto `RME` es la Razon de Mortalidad Estandarizada para cada municipio tras
+el suavizado BYM.
+
+```{r}
+parameter_samples = rstan::extract(bym2_fit);
+parameter_summary = summary(bym2_fit, pars = c("mu"), probs = c(0.1, 0.9))$summary;
+parameter_mean <- parameter_summary[, "mean"];
+RME <- round(parameter_mean/E, 3);
+```
+
+Ahora calculamos la probabilidad de que un municipio tenga un RME > 1.
+cada $mu_{municipio}$ tiene 3000 samples. Calculamos para cada municipio cual es
+la proporcion de RME > 1. Creamos 4 grupos segun el intervalo en el que caiga
+esta proporcion.
+
+```{r}
+RME_samples <-sweep(parameter_samples$mu,2,E,FUN="/");
+prob_riesgo <- data.frame(RME_samples>1) ;
+riesgo <- (colSums(prob_riesgo)/3000);
+v <-c( 0.4,0.7,0.9);
+grupo_riesgo <- data.frame(CODMUNI=aragon_shp$CODMUNI, grupo=findInterval(riesgo, v))
+```
+
+# BYM con INLA
+
+Hacemos ahora el suavizado BYM con INLA:
+
+```{r}
+g = nb2mat(nb_aragon);
+prior_iid = c(1,0.01);
+prior_besag = c(1,0.001);
+initial_iid = 4;
+initial_besag = 3;
+values = as.factor(unique(c(Aragon.df$CODMUNI))) ;
+formula1.bym = O ~ f(CODMUNI, values = values, model = "bym", graph= g,
+                     
+                     param = c(prior_iid, prior_besag),
+                     
+                     initial = c(initial_iid, initial_besag))
+result1_bym = inla(formula1.bym,family="poisson",data=Aragon.df,E=E);
+INLA<-(result1_bym$summary.random$CODMUNI$mean)[1:729]+1
+```
+
+Anadimos estos datos al objeto `aragon_shp` para poder represaentarlo graficamente.
+
+```{r}
+aragon_shp@data$RME_cruda <- Aragon.df$O / Aragon.df$E;
+aragon_shp@data$RME_STAN <- RME;
+aragon_shp@data$grupo <-factor(grupo_riesgo$grupo);
+aragon_shp@data$RME_INLA <-INLA;
+
+aragon_shp@data <- aragon_shp@data %>% mutate(id = row.names(.));
+shp_df <- broom::tidy(aragon_shp, region = ("CODMUNI"));
+shp_df <- shp_df %>% left_join(aragon_shp@data, by = c("id"="CODMUNI"))
+```
+
+# Mapas
+
+Dibujamos los mapas con `ggplot()`.
+
+```{r}
+map <- ggplot(data = shp_df, aes(x = long, y = lat, group = group), colour = "black") + 
+  theme_void()+
+  coord_fixed(1);
+
+map0 <- map + geom_polygon(aes(fill = RME_cruda)) +
+  labs(fill="RME cruda") +
+  scale_fill_viridis(option='A',limits = c(0, 4));
+
+map1 <- map + geom_polygon(aes(fill = RME_STAN)) +
+    labs(fill="Suavizado BYM\ncon STAN") +
+  scale_fill_viridis(option='A',limits = c(0.7, 1.7));
+
+map2 <- map + 
+  geom_polygon(aes(fill = RME_INLA)) + 
+  labs(fill="Suavizado BYM\ncon  INLA") +
+  scale_fill_viridis(option='A',limits = c(0.7, 1.7));
+
+map3 <- map +
+  geom_polygon(aes(fill = grupo)) +
+  scale_fill_viridis(option='A',
+                     discrete=T,
+                     labels=c('< 0.4', '[0.4, 0.7]','[0.7, 0.9]','> 0.9'))+
+  labs(fill="Probabilidad \nde una RME >1");
+
+grid.arrange(map0,map1,map2,map3, nrow=2)
+```
+
+
+
+
